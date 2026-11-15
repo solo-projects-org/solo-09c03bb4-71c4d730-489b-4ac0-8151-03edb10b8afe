@@ -1,4 +1,4 @@
-"""Domain service: batch ingestion, report pinning, atomic output."""
+"""Domain service: streaming batch ingestion, report pinning, atomic output."""
 
 from __future__ import annotations
 
@@ -9,15 +9,23 @@ import sqlite3
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 from . import features
 from .config import Settings
-from .csvparse import BatchRejected, parse_samples, parse_transactions
+from .csvparse import (
+    BatchRejected, stream_samples, stream_transactions,
+)
 from .db import Database
 
 UTC = timezone.utc
+
+# Prefixes that always denote transient, uncommitted upload/working files.
+SPOOL_PREFIXES = (".spool-", ".tmp-")
+CHUNK = 1 << 20
 
 
 def now_epoch() -> int:
@@ -31,10 +39,25 @@ class ConflictError(Exception):
         self.existing_batch_id = existing_batch_id
 
 
+@dataclass(frozen=True)
+class StagedUpload:
+    """An upload already streamed to disk by the web layer.
+
+    The service takes ownership of ``path`` and removes it as soon as the
+    batch is either committed or rejected, so request handling never needs the
+    whole request body in memory.
+    """
+
+    path: Path
+    byte_size: int
+    sha256: str
+    filename: str
+
+
 def _hash_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
+        for chunk in iter(lambda: fh.read(CHUNK), b""):
             h.update(chunk)
     return h.hexdigest()
 
@@ -43,27 +66,74 @@ class AppService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.settings.ensure_dirs()
+        self._cleanup_stale_spools()
         self.db = Database(settings.db_path)
         self.db.init()
 
-    # ------------------------------------------------------------------ #
-    # Uploads
-    # ------------------------------------------------------------------ #
-    def _store_upload(self, kind: str, filename: str, data: bytes,
-                      parsed_rows: int, stored_rows: int,
-                      insert_fn) -> int:
-        """Persist bytes first, then rows, in one DB transaction.
+    def _cleanup_stale_spools(self) -> None:
+        """Remove spool/temp files left by a process that died mid-upload."""
+        for entry in self.settings.uploads_dir.iterdir():
+            if entry.is_file() and entry.name.startswith(SPOOL_PREFIXES):
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
 
-        If the DB commit fails, remove the just-written file. Files are named
-        by content hash plus a UUID so a retry never overwrites a source that
-        an existing report is pinned to.
+    # ------------------------------------------------------------------ #
+    # Upload staging
+    # ------------------------------------------------------------------ #
+    def spool_bytes(self, filename: str, data: bytes) -> StagedUpload:
+        """Stage an in-memory payload (e.g. direct API/test callers).
+
+        HTTP uploads are streamed to disk by ``app.main._spool_upload``
+        instead; this keeps the service callable with the original
+        ``(filename, bytes)`` signature.
         """
+        if len(data) > self.settings.max_upload_bytes:
+            raise BatchRejected(
+                "上传文件超过大小限制。",
+                [{"row": 0, "field": "", "code": "too_large",
+                  "message": f"上限 {self.settings.max_upload_bytes} 字节。",
+                  "value": ""}])
+        if not data:
+            raise BatchRejected(
+                "上传文件为空。",
+                [{"row": 0, "field": "", "code": "empty",
+                  "message": "0 字节。", "value": ""}])
         digest = hashlib.sha256(data).hexdigest()
-        safe_name = Path(filename).name[:120] or f"{kind}.csv"
-        target = self.settings.uploads_dir / f"{digest[:16]}-{uuid.uuid4().hex[:12]}-{safe_name}"
-        tmp = self.settings.uploads_dir / f".tmp-{uuid.uuid4().hex}"
-        tmp.write_bytes(data)
-        os.replace(tmp, target)
+        fd, name = tempfile.mkstemp(prefix=".spool-", suffix=".csv",
+                                    dir=self.settings.uploads_dir)
+        path = Path(name)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return StagedUpload(path=path, byte_size=len(data), sha256=digest,
+                            filename=filename)
+
+    # ------------------------------------------------------------------ #
+    # Shared commit machinery
+    # ------------------------------------------------------------------ #
+    def _commit_batch(self, staged: StagedUpload, kind: str, submitted_rows: int,
+                      insert_fn) -> int:
+        """Insert the batch header and rows in one DB transaction, then publish.
+
+        ``insert_fn`` streams rows from the spool while it still carries its
+        hidden ``.spool-`` staging name; any validation/conflict error raises
+        inside the transaction, which rolls back before the source file is
+        ever renamed into place. Only after every row has settled does
+        :func:`os.replace` publish the content-addressed final name, and if
+        the commit itself still fails the published file is unlinked, so no
+        half-batch is ever visible. The UUID suffix means a retry never
+        overwrites a source pinned to an existing report.
+        """
+        safe_name = Path(staged.filename).name[:120] or f"{kind}.csv"
+        target = (self.settings.uploads_dir
+                  / f"{staged.sha256[:16]}-{uuid.uuid4().hex[:12]}-{safe_name}")
         try:
             with self.db.write_transaction() as conn:
                 cur = conn.execute(
@@ -71,15 +141,19 @@ class AppService:
                                            submitted_rows, stored_rows, stored_path,
                                            uploaded_at)
                        VALUES (?,?,?,?,?,?,?,?)""",
-                    (kind, safe_name, len(data), digest, parsed_rows,
-                     stored_rows, str(target), now_epoch()),
+                    (kind, safe_name, staged.byte_size, staged.sha256,
+                     submitted_rows, submitted_rows, str(target), now_epoch()),
                 )
                 batch_id = cur.lastrowid
+                # Stream rows from the spool while it still exists under its
+                # staging name; a conflict raises here and rolls everything
+                # back before the file is ever published.
                 inserted = insert_fn(conn, batch_id)
-                if inserted is not None and inserted != stored_rows:
+                if inserted is not None and inserted != submitted_rows:
                     conn.execute(
                         "UPDATE batches SET stored_rows=? WHERE id=?",
                         (inserted, batch_id))
+                os.replace(staged.path, target)
             return batch_id
         except BaseException:
             try:
@@ -88,106 +162,319 @@ class AppService:
                 pass
             raise
 
-    def upload_transactions(self, filename: str, data: bytes) -> dict:
-        parsed = parse_transactions(data)
-        stored = {"rows": 0, "skipped_same_value": 0}
+    def _as_staged(self, filename: str,
+                   source: StagedUpload | str | os.PathLike | bytes | BinaryIO,
+                   default_name: str) -> StagedUpload:
+        """Normalise the accepted input shapes to an owned StagedUpload."""
+        if isinstance(source, StagedUpload):
+            if source.byte_size > self.settings.max_upload_bytes:
+                source.path.unlink(missing_ok=True)
+                raise BatchRejected(
+                    "上传文件超过大小限制。",
+                    [{"row": 0, "field": "", "code": "too_large",
+                      "message": f"上限 {self.settings.max_upload_bytes} 字节。",
+                      "value": ""}])
+            return source
+        if isinstance(source, (str, os.PathLike)):
+            # A caller-provided path is not ours to rename or delete: copy it
+            # into a service-owned spool so commit/replace/cleanup semantics
+            # stay uniform and the caller's file remains untouched.
+            src = Path(source)
+            size = src.stat().st_size
+            if size > self.settings.max_upload_bytes:
+                raise BatchRejected(
+                    "上传文件超过大小限制。",
+                    [{"row": 0, "field": "", "code": "too_large",
+                      "message": f"上限 {self.settings.max_upload_bytes} 字节。",
+                      "value": ""}])
+            fd, name = tempfile.mkstemp(prefix=".spool-", suffix=".csv",
+                                        dir=self.settings.uploads_dir)
+            path = Path(name)
+            digest = hashlib.sha256()
+            try:
+                with os.fdopen(fd, "wb") as out, src.open("rb") as inp:
+                    while True:
+                        chunk = inp.read(CHUNK)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        out.write(chunk)
+                    out.flush()
+                    os.fsync(out.fileno())
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+            return StagedUpload(path=path, byte_size=size,
+                                sha256=digest.hexdigest(),
+                                filename=filename or default_name)
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            return self.spool_bytes(filename or default_name, bytes(source))
+        if hasattr(source, "read"):
+            return self._spool_stream(filename or default_name, source)
+        raise TypeError(f"不支持的上传数据类型：{type(source)!r}")
 
-        def insert(conn: sqlite3.Connection, batch_id: int) -> None:
+    def _spool_stream(self, filename: str, stream: BinaryIO) -> StagedUpload:
+        """Copy an open binary stream to an owned spool file in bounded chunks."""
+        fd, name = tempfile.mkstemp(prefix=".spool-", suffix=".csv",
+                                    dir=self.settings.uploads_dir)
+        path = Path(name)
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                while True:
+                    chunk = stream.read(CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self.settings.max_upload_bytes:
+                        raise BatchRejected(
+                            "上传文件超过大小限制。",
+                            [{"row": 0, "field": "", "code": "too_large",
+                              "message": f"上限 {self.settings.max_upload_bytes} 字节。",
+                              "value": ""}])
+                    digest.update(chunk)
+                    fh.write(chunk)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        if total == 0:
+            path.unlink(missing_ok=True)
+            raise BatchRejected(
+                "上传文件为空。",
+                [{"row": 0, "field": "", "code": "empty", "message": "0 字节。",
+                  "value": ""}])
+        return StagedUpload(path=path, byte_size=total,
+                            sha256=digest.hexdigest(), filename=filename)
+
+    # ------------------------------------------------------------------ #
+    # Uploads
+    # ------------------------------------------------------------------ #
+    def upload_transactions(self, filename: str, source) -> dict:
+        """Stream a transaction CSV from its spool into the database.
+
+        The spool is parsed exactly once, row by row, inside the batch's
+        IMMEDIATE transaction: validated rows land in a connection-local
+        temporary staging table in bounded chunks, then set-based SQL
+        arbitrates (event_id, ingested_at). Identical retries are skipped,
+        differing values reject and roll the *whole* batch back — including
+        the batch header row — so no half-batch is ever visible. Memory stays
+        flat because neither parsed objects nor pending rows are retained.
+        """
+        staged = self._as_staged(filename, source, "transactions.csv")
+        try:
+            counters = {"stored": 0, "skipped": 0}
             conflicts: list[dict] = []
-            seen: dict[tuple[str, int], str] = {}
-            for t in parsed.transactions:
-                key = (t.event_id, t.ingested_at)
-                if key in seen:
-                    if seen[key] != t.raw_hash:
-                        conflicts.append({
-                            "row": t.row_number, "field": "event_id",
-                            "code": "same_ingest_conflict",
-                            "message": f"事件 {t.event_id} 在入库时刻 {t.ingested_at} "
-                                       "在本批次内出现不同取值，整批拒收。",
-                            "value": t.event_id})
-                    else:
-                        stored["skipped_same_value"] += 1
-                    continue
-                seen[key] = t.raw_hash
-                prior = conn.execute(
-                    """SELECT raw_hash FROM transactions
-                       WHERE event_id=? AND ingested_at=?""",
-                    key).fetchone()
-                if prior is not None:
-                    if prior["raw_hash"] != t.raw_hash:
-                        conflicts.append({
-                            "row": t.row_number, "field": "event_id",
-                            "code": "same_ingest_conflict",
-                            "message": f"事件 {t.event_id} 在入库时刻 {t.ingested_at} "
-                                       "已存在不同取值的修订，整批拒收。",
-                            "value": t.event_id})
-                    else:
-                        stored["skipped_same_value"] += 1
-                    continue
+            chunk_size = 1000
+
+            def insert(conn: sqlite3.Connection, batch_id: int) -> int:
+                # Scratch table for this one connection/transaction.
+                conn.execute(self.db.temp_staging_ddl())
+                conn.execute(self.db.temp_staging_index())
+                chunk: list[tuple] = []
+                submitted_rows = 0
+
+                def flush() -> None:
+                    if not chunk:
+                        return
+                    conn.executemany(
+                        "INSERT INTO temp.txn_staging(row_number, event_id, "
+                        "account_id, occurred_at, ingested_at, amount_minor, "
+                        "amount_text, action, raw_hash) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)", chunk)
+                    chunk.clear()
+
+                # Single streaming pass: validation errors raise here, before
+                # any real table has received a committed row.
+                for t in stream_transactions(staged.path):
+                    submitted_rows += 1
+                    chunk.append((t.row_number, t.event_id, t.account_id,
+                                  t.occurred_at, t.ingested_at, t.amount_minor,
+                                  t.amount_text, t.action, t.raw_hash))
+                    if len(chunk) >= chunk_size:
+                        flush()
+                flush()
+                if submitted_rows == 0:  # defensive; parser already guards
+                    raise BatchRejected(
+                        "交易 CSV 没有有效数据行。",
+                        [{"row": 2, "field": "", "code": "no_rows",
+                          "message": "至少需要一行交易。", "value": ""}])
                 conn.execute(
+                    "UPDATE batches SET submitted_rows=? WHERE id=?",
+                    (submitted_rows, batch_id))
+
+                # Rule 1: within this very upload, the same (event, ingest
+                # instant) carrying different raw_hash rejects the whole
+                # batch; identical duplicates are silently de-duplicated.
+                intra = conn.execute(
+                    "SELECT event_id, ingested_at, COUNT(DISTINCT raw_hash) AS v "
+                    "FROM temp.txn_staging GROUP BY event_id, ingested_at "
+                    "HAVING COUNT(DISTINCT raw_hash) > 1").fetchall()
+                if intra:
+                    marks = {(r["event_id"], r["ingested_at"]) for r in intra}
+                    for r in conn.execute(
+                            "SELECT row_number, event_id, ingested_at "
+                            "FROM temp.txn_staging ORDER BY row_number"):
+                        if (r["event_id"], r["ingested_at"]) in marks:
+                            conflicts.append({
+                                "row": r["row_number"], "field": "event_id",
+                                "code": "same_ingest_conflict",
+                                "message": f"事件 {r['event_id']} 在入库时刻 "
+                                           f"{r['ingested_at']} 在本批次内出现不同取值，"
+                                           "整批拒收。",
+                                "value": r["event_id"]})
+                            if len(conflicts) >= 100:
+                                break
+                    raise BatchRejected(
+                        "交易批次整批拒收：同一事件同一入库时刻出现不同取值。",
+                        conflicts)
+
+                # Rule 2: against already-committed revisions, a differing
+                # raw_hash rejects the whole batch; an identical one is an
+                # idempotent retry and is skipped.
+                cross = conn.execute(
+                    "SELECT s.row_number, s.event_id, s.ingested_at, s.raw_hash "
+                    "FROM temp.txn_staging s "
+                    "JOIN transactions x ON x.event_id = s.event_id "
+                    "AND x.ingested_at = s.ingested_at "
+                    "WHERE x.raw_hash <> s.raw_hash "
+                    "ORDER BY s.row_number LIMIT 100").fetchall()
+                if cross:
+                    for r in cross:
+                        conflicts.append({
+                            "row": r["row_number"], "field": "event_id",
+                            "code": "same_ingest_conflict",
+                            "message": f"事件 {r['event_id']} 在入库时刻 "
+                                       f"{r['ingested_at']} 已存在不同取值的修订，"
+                                       "整批拒收。",
+                            "value": r["event_id"]})
+                    raise BatchRejected(
+                        "交易批次整批拒收：同一事件同一入库时刻出现不同取值。",
+                        conflicts)
+
+                # One row per (event, ingest instant, content); intra-batch
+                # identical duplicates collapse via GROUP BY, and keys that
+                # already exist with the same raw_hash are not re-inserted.
+                inserted = conn.execute(
                     """INSERT INTO transactions(batch_id, event_id, account_id,
                            occurred_at, ingested_at, amount_minor, amount_text,
                            action, raw_hash, row_number)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (batch_id, t.event_id, t.account_id, t.occurred_at,
-                     t.ingested_at, t.amount_minor, t.amount_text, t.action,
-                     t.raw_hash, t.row_number),
-                )
-                stored["rows"] += 1
-            if conflicts:
-                raise BatchRejected(
-                    "交易批次整批拒收：同一事件同一入库时刻出现不同取值。",
-                    conflicts)
-            return stored["rows"]
+                       SELECT ?, event_id, MIN(account_id), MIN(occurred_at),
+                              ingested_at, MIN(amount_minor), MIN(amount_text),
+                              MIN(action), raw_hash, MIN(row_number)
+                       FROM temp.txn_staging
+                       GROUP BY event_id, ingested_at, raw_hash
+                       HAVING NOT EXISTS (
+                           SELECT 1 FROM transactions x
+                           WHERE x.event_id = temp.txn_staging.event_id
+                             AND x.ingested_at = temp.txn_staging.ingested_at)""",
+                    (batch_id,)).rowcount
+                # Every staging row that did not become a new revision is an
+                # identical-value duplicate: either collapsed by GROUP BY
+                # (repeated inside this upload) or excluded by NOT EXISTS
+                # (idempotent retry of an already committed revision).
+                skipped = submitted_rows - inserted
+                counters["stored"] = inserted
+                counters["skipped"] = skipped
+                counters["submitted"] = submitted_rows
+                return inserted
 
-        batch_id = self._store_upload(
-            "transactions", filename, data, len(parsed.transactions),
-            len(parsed.transactions), insert)
+            batch_id = self._commit_batch(staged, "transactions", 0, insert)
+            submitted_rows = counters["submitted"]
+        except BaseException:
+            staged.path.unlink(missing_ok=True)
+            raise
+        with self.db.read() as conn:
+            event_groups = conn.execute(
+                "SELECT DISTINCT event_id FROM transactions "
+                "WHERE batch_id=?", (batch_id,)).fetchall()
         return {
             "batch_id": batch_id,
             "kind": "transactions",
-            "rows": len(parsed.transactions),
-            "stored_rows": stored["rows"],
-            "skipped_same_value": stored["skipped_same_value"],
-            "events": len({t.event_id for t in parsed.transactions}),
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "rows": submitted_rows,
+            "stored_rows": counters["stored"],
+            "skipped_same_value": counters["skipped"],
+            "events": len(event_groups),
+            "sha256": staged.sha256,
         }
 
-    def upload_samples(self, filename: str, data: bytes) -> dict:
-        parsed = parse_samples(data)
+    def upload_samples(self, filename: str, source) -> dict:
+        """Streaming counterpart of :meth:`upload_transactions`.
 
-        def insert(conn: sqlite3.Connection, batch_id: int) -> None:
-            conflicts = []
-            for s in parsed.samples:
-                prior = conn.execute(
-                    "SELECT batch_id FROM samples WHERE sample_id=?",
-                    (s.sample_id,)).fetchone()
-                if prior is not None:
-                    conflicts.append({
-                        "row": s.row_number, "field": "sample_id",
-                        "code": "duplicate_sample_id",
-                        "message": f"样本号 {s.sample_id} 已在批次 "
-                                   f"#{prior['batch_id']} 中存在；样本号必须全局唯一。",
-                        "value": s.sample_id})
-                    continue
+        Same single-pass, rollback-safe shape: rows stream into a temp staging
+        table inside the batch transaction, and a set-based duplicate check
+        against the globally unique ``sample_id`` rejects the whole batch.
+        """
+        staged = self._as_staged(filename, source, "samples.csv")
+        try:
+            counters = {"submitted": 0}
+            conflicts: list[dict] = []
+
+            def insert(conn: sqlite3.Connection, batch_id: int) -> int:
                 conn.execute(
+                    "CREATE TEMP TABLE sample_staging ("
+                    "row_number INTEGER NOT NULL, sample_id TEXT NOT NULL, "
+                    "account_id TEXT NOT NULL, audit_at INTEGER NOT NULL, "
+                    "label INTEGER NOT NULL)")
+                chunk: list[tuple] = []
+                submitted_rows = 0
+                for s in stream_samples(staged.path):
+                    submitted_rows += 1
+                    chunk.append((s.row_number, s.sample_id, s.account_id,
+                                  s.audit_at, s.label))
+                    if len(chunk) >= 1000:
+                        conn.executemany(
+                            "INSERT INTO temp.sample_staging VALUES (?,?,?,?,?)",
+                            chunk)
+                        chunk.clear()
+                if chunk:
+                    conn.executemany(
+                        "INSERT INTO temp.sample_staging VALUES (?,?,?,?,?)",
+                        chunk)
+                if submitted_rows == 0:
+                    raise BatchRejected(
+                        "样本 CSV 没有有效数据行。",
+                        [{"row": 2, "field": "", "code": "no_rows",
+                          "message": "至少需要一行样本。", "value": ""}])
+                conn.execute(
+                    "UPDATE batches SET submitted_rows=? WHERE id=?",
+                    (submitted_rows, batch_id))
+                dupes = conn.execute(
+                    "SELECT s.row_number, s.sample_id, x.batch_id "
+                    "FROM temp.sample_staging s "
+                    "JOIN samples x ON x.sample_id = s.sample_id "
+                    "ORDER BY s.row_number LIMIT 100").fetchall()
+                if dupes:
+                    for r in dupes:
+                        conflicts.append({
+                            "row": r["row_number"], "field": "sample_id",
+                            "code": "duplicate_sample_id",
+                            "message": f"样本号 {r['sample_id']} 已在批次 "
+                                       f"#{r['batch_id']} 中存在；"
+                                       "样本号必须全局唯一。",
+                            "value": r["sample_id"]})
+                    raise BatchRejected("样本批次整批拒收：样本号重复。", conflicts)
+                inserted = conn.execute(
                     """INSERT INTO samples(batch_id, sample_id, account_id,
                            audit_at, label, row_number)
-                       VALUES (?,?,?,?,?,?)""",
-                    (batch_id, s.sample_id, s.account_id, s.audit_at,
-                     s.label, s.row_number),
-                )
-            if conflicts:
-                raise BatchRejected("样本批次整批拒收：样本号重复。", conflicts)
+                       SELECT ?, sample_id, account_id, audit_at, label,
+                              row_number FROM temp.sample_staging""",
+                    (batch_id,)).rowcount
+                counters["submitted"] = submitted_rows
+                return inserted
 
-        batch_id = self._store_upload(
-            "samples", filename, data, len(parsed.samples),
-            len(parsed.samples), insert)
+            batch_id = self._commit_batch(staged, "samples", 0, insert)
+            submitted_rows = counters["submitted"]
+        except BaseException:
+            staged.path.unlink(missing_ok=True)
+            raise
         return {
             "batch_id": batch_id,
             "kind": "samples",
-            "rows": len(parsed.samples),
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "rows": submitted_rows,
+            "sha256": staged.sha256,
         }
 
     # ------------------------------------------------------------------ #

@@ -1,8 +1,13 @@
-"""Strict CSV parsing, canonicalisation, and UTC-timestamp handling.
+"""Strict, *streaming* CSV parsing, canonicalisation and UTC-timestamp handling.
 
 The parser is deliberately unforgiving: a submitted batch is accepted in full
 or rejected in full. Every problem is collected so the operator sees the
-complete diagnosis in one pass.
+diagnosis in one pass; the detail list is capped (a counter is retained) so a
+pathological file can never exhaust memory through error objects either.
+
+Parsing works off an on-disk spool file, one CSV record at a time, so a
+hundred-thousand-row upload never has its decoded text, row dictionaries or
+parsed objects resident in memory simultaneously.
 """
 
 from __future__ import annotations
@@ -10,14 +15,22 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Iterator, BinaryIO
 
 UTC = timezone.utc
 MIN_EPOCH = -62_135_596_800   # 0001-01-01T00:00:00Z
 MAX_EPOCH = 253_402_300_799   # 9999-12-31T23:59:59Z
+
+# Keep error payloads bounded: details beyond this many are summarised rather
+# than retained, while the total count is still reported.
+MAX_REPORTED_ISSUES = 100
 
 TRANSACTION_HEADERS = [
     "event_id", "account_id", "occurred_at", "ingested_at",
@@ -44,6 +57,9 @@ ACTION_REVISE = "revise"
 ACTION_CANCEL = "cancel"
 
 _ASCII_WS = re.compile(r"[ \t\r\n\f\v]+")
+_EPOCH_RE = re.compile(r"-?\d{1,11}")
+_DECIMAL_RE = re.compile(r"-?\d{1,15}(?:\.\d{1,2})?")
+_LABEL_RE = re.compile(r"0|1")
 
 
 class ParseError(Exception):
@@ -107,79 +123,307 @@ def _row_error(row: int, field_name: str, code: str, message: str, value: str = 
             "message": message, "value": value}
 
 
-def _read_table(data: bytes, expected: list[str], kind: str,
-                aliases: dict[str, set[str]] | None = None) -> list[dict]:
-    """Decode strictly as UTF-8 (with optional BOM) and validate the header."""
-    try:
-        text = data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise BatchRejected(
-            f"{kind} CSV 必须是 UTF-8 编码（可带 BOM）。",
-            [_row_error(1, "", "encoding", "无法按 UTF-8 解码，可能为 GBK/Excel 导出。")],
-        )
-    try:
-        reader = csv.reader(io.StringIO(text, newline=""), strict=True)
-        rows = list(reader)
-    except csv.Error as exc:
-        raise BatchRejected(
-            f"{kind} CSV 格式损坏，无法解析：{exc}",
-            [_row_error(0, "", "malformed_csv", str(exc))],
-        )
-    if not rows:
-        raise BatchRejected(f"{kind} CSV 为空。",
-                            [_row_error(1, "", "empty", "未找到表头。")])
-    header = [cell.lstrip("﻿").strip() for cell in rows[0]]
+class _IssueCollector:
+    """Accumulates row errors with a hard cap on retained detail objects."""
+
+    def __init__(self) -> None:
+        self.details: list[dict] = []
+        self.total = 0
+
+    def add(self, detail: dict) -> None:
+        self.total += 1
+        if len(self.details) < MAX_REPORTED_ISSUES:
+            self.details.append(detail)
+
+    def summary(self) -> list[dict]:
+        if self.total > len(self.details):
+            return self.details + [_row_error(
+                0, "", "more_issues",
+                f"仅展示前 {MAX_REPORTED_ISSUES} 条问题，本批次共 {self.total} 处。")]
+        return self.details
+
+
+def _normalise_key(cell: str) -> str:
+    return cell.replace("﻿", "").strip().lower().replace(" ", "").replace("-", "_")
+
+
+def _map_header(header: list[str], expected: list[str], kind: str,
+                aliases: dict[str, set[str]] | None) -> tuple[dict[str, int], int]:
+    """Validate the header row and return column indexes plus row width."""
+    clean = [cell.replace("﻿", "").strip() for cell in header]
     if aliases is None:
-        if header != expected:
+        if clean != expected:
             raise BatchRejected(
                 f"{kind} CSV 表头必须严格为：{', '.join(expected)}。",
                 [_row_error(1, "header", "header", "表头不符合约定",
-                            ", ".join(header))],
+                            ", ".join(clean))],
             )
-        column_map = {name: i for i, name in enumerate(expected)}
-    else:
-        normalized = {}
-        for i, cell in enumerate(header):
-            key = cell.strip().lower().replace(" ", "").replace("-", "_")
-            canonical = None
-            for name, names in aliases.items():
-                if key in {n.lower().replace(" ", "").replace("-", "_") for n in names}:
-                    canonical = name
-                    break
-            if canonical is None:
-                continue  # extra columns are tolerated and ignored
-            if canonical in normalized:
-                raise BatchRejected(
-                    f"{kind} CSV 表头含重复列 {canonical}。",
-                    [_row_error(1, canonical, "duplicate_header",
-                                f"第 {normalized[canonical] + 1} 列与第 {i + 1} 列重复。")],
-                )
-            normalized[canonical] = i
-        missing = [name for name in expected if name not in normalized]
-        if missing:
+        return {name: i for i, name in enumerate(expected)}, len(header)
+    normalized: dict[str, int] = {}
+    alias_keys = {
+        name: {_normalise_key(n) for n in names}
+        for name, names in aliases.items()
+    }
+    for i, cell in enumerate(header):
+        key = _normalise_key(cell)
+        canonical = None
+        for name, keys in alias_keys.items():
+            if key in keys:
+                canonical = name
+                break
+        if canonical is None:
+            continue  # extra columns are tolerated and ignored
+        if canonical in normalized:
             raise BatchRejected(
-                f"{kind} CSV 缺少必需列：{', '.join(missing)}。",
-                [_row_error(1, "header", "missing_header",
-                            f"缺少列：{', '.join(missing)}；实际表头：{', '.join(header)}")],
+                f"{kind} CSV 表头含重复列 {canonical}。",
+                [_row_error(1, canonical, "duplicate_header",
+                            f"第 {normalized[canonical] + 1} 列与第 {i + 1} 列重复。")],
             )
-        column_map = normalized
-    width = len(header)
-    out = []
-    for row_number, cells in enumerate(rows[1:], start=2):
-        if not cells or all(not c.strip() for c in cells):
+        normalized[canonical] = i
+    missing = [name for name in expected if name not in normalized]
+    if missing:
+        raise BatchRejected(
+            f"{kind} CSV 缺少必需列：{', '.join(missing)}。",
+            [_row_error(1, "header", "missing_header",
+                        f"缺少列：{', '.join(missing)}；实际表头：{', '.join(clean)}")],
+        )
+    return normalized, len(header)
+
+
+def _iter_records(source: str | os.PathLike | BinaryIO, kind: str
+                  ) -> Iterator[tuple[int, list[str]]]:
+    """Yield ``(row_number, cells)`` one CSV record at a time.
+
+    The file is decoded incrementally as UTF-8 (BOM tolerated); neither the
+    decoded text nor the full row list is ever materialised. Decode and CSV
+    structural errors are translated to :class:`BatchRejected` with the
+    offending source row number.
+    """
+    owns = not hasattr(source, "read")
+    fh: BinaryIO | None = None
+    try:
+        if owns:
+            fh = open(source, "rb")  # type: ignore[arg-type]
+            stream: BinaryIO = fh
+        else:
+            stream = source  # type: ignore[assignment]
+        text = io.TextIOWrapper(stream, encoding="utf-8-sig", newline="",
+                                errors="strict")
+        reader = csv.reader(text, strict=True)
+        row_number = 0
+        while True:
+            row_number += 1
+            try:
+                record = next(reader)
+            except StopIteration:
+                return
+            except UnicodeDecodeError as exc:
+                raise BatchRejected(
+                    f"{kind} CSV 必须是 UTF-8 编码（可带 BOM）。",
+                    [_row_error(row_number, "", "encoding",
+                                f"无法按 UTF-8 解码（第 {row_number} 行附近）：{exc}")],
+                )
+            except csv.Error as exc:
+                raise BatchRejected(
+                    f"{kind} CSV 格式损坏，无法解析：{exc}",
+                    [_row_error(row_number, "", "malformed_csv", str(exc))],
+                )
+            yield row_number, record
+    finally:
+        if owns and fh is not None:
+            fh.close()
+
+
+def _is_blank(cells: list[str]) -> bool:
+    for c in cells:
+        if c.strip():
+            return False
+    return True
+
+
+def _has_nul(cells: list[str]) -> bool:
+    for c in cells:
+        if "\x00" in c:
+            return True
+    return False
+
+
+def stream_transactions(source: str | os.PathLike | BinaryIO
+                        ) -> Iterator[TransactionRevision]:
+    """Yield validated transaction revisions one row at a time.
+
+    Header/encoding/structural failures raise immediately; row validation
+    failures are collected and raised as :class:`BatchRejected` when iteration
+    of the spool completes, so no valid-looking consumer can swallow a
+    rejected batch.
+    """
+    records = _iter_records(source, "交易")
+    try:
+        header_row, header = next(records)
+    except StopIteration:
+        raise BatchRejected("交易 CSV 为空。",
+                            [_row_error(1, "", "empty", "未找到表头。")])
+    column_map, width = _map_header(header, TRANSACTION_HEADERS, "交易",
+                                    TRANSACTION_ALIASES)
+    issues = _IssueCollector()
+    data_rows = 0
+    emitted = 0
+    for row_number, cells in records:
+        if _is_blank(cells):
+            continue
+        data_rows += 1
+        if _has_nul(cells):
+            issues.add(_row_error(row_number, "", "nul_byte",
+                                  "文件包含 NUL 字符。"))
             continue
         if len(cells) != width:
-            out.append({"__row__": row_number,
-                        "__error__": _row_error(row_number, "", "column_count",
-                                                f"应有 {width} 列，实际 {len(cells)} 列。")})
+            issues.add(_row_error(row_number, "", "column_count",
+                                  f"应有 {width} 列，实际 {len(cells)} 列。"))
             continue
-        out.append({"__row__": row_number,
-                    **{name: cells[idx] for name, idx in column_map.items()}})
-    # CSV uses LF/CRLF internally; reject physical NULs outright.
-    if "\x00" in text:
-        raise BatchRejected(f"{kind} CSV 含 NUL 字符。",
-                            [_row_error(0, "", "nul_byte", "文件包含 NUL 字符。")])
-    return out
+        row_issues: list[dict] = []
+        n = row_number
+        event_id = _parse_text(cells[column_map["event_id"]], n, "event_id",
+                               row_issues, "事件号")
+        account_id = _parse_text(cells[column_map["account_id"]], n,
+                                 "account_id", row_issues, "账户")
+        occurred = _parse_epoch(cells[column_map["occurred_at"]], n,
+                                "occurred_at", row_issues, "发生时刻")
+        ingested = _parse_epoch(cells[column_map["ingested_at"]], n,
+                                "ingested_at", row_issues, "入库时刻")
+        amount = _parse_decimal(cells[column_map["amount"]], n, "amount",
+                                row_issues, "金额")
+        action = _parse_action(cells[column_map["action"]], n, row_issues)
+        if action == ACTION_REVISE and amount is not None and amount == 0:
+            row_issues.append(_row_error(n, "amount", "amount_positive",
+                                         "更新交易的金额必须大于 0。",
+                                         cells[column_map["amount"]]))
+        for detail in row_issues:
+            issues.add(detail)
+        if row_issues:
+            continue
+        if not (event_id and account_id and occurred is not None
+                and ingested is not None and amount is not None and action):
+            continue
+        emitted += 1
+        yield TransactionRevision(
+            row_number=n, event_id=event_id, account_id=account_id,
+            occurred_at=occurred, ingested_at=ingested, amount=amount,
+            amount_minor=int(amount * 100),
+            amount_text=format(amount, ".2f"),
+            action=action,
+            raw_hash=canonical_raw_hash([
+                event_id, account_id, str(occurred), str(ingested),
+                format(amount, ".2f"), action,
+            ]),
+        )
+    if issues.total:
+        raise BatchRejected(
+            f"交易批次整批拒收：共 {data_rows} 行，发现 {issues.total} 处问题，"
+            "未写入任何数据。",
+            issues.summary(),
+        )
+    if emitted == 0:
+        raise BatchRejected("交易 CSV 没有有效数据行。",
+                            [_row_error(2, "", "no_rows", "至少需要一行交易。")])
+
+
+def stream_samples(source: str | os.PathLike | BinaryIO) -> Iterator[SampleRow]:
+    """Yield validated sample rows one at a time (in-file duplicates checked)."""
+    records = _iter_records(source, "样本")
+    try:
+        _, header = next(records)
+    except StopIteration:
+        raise BatchRejected("样本 CSV 为空。",
+                            [_row_error(1, "", "empty", "未找到表头。")])
+    column_map, width = _map_header(header, SAMPLE_HEADERS, "样本",
+                                    SAMPLE_ALIASES)
+    issues = _IssueCollector()
+    seen: dict[str, int] = {}
+    data_rows = 0
+    emitted = 0
+    for row_number, cells in records:
+        if _is_blank(cells):
+            continue
+        data_rows += 1
+        if _has_nul(cells):
+            issues.add(_row_error(row_number, "", "nul_byte",
+                                  "文件包含 NUL 字符。"))
+            continue
+        if len(cells) != width:
+            issues.add(_row_error(row_number, "", "column_count",
+                                  f"应有 {width} 列，实际 {len(cells)} 列。"))
+            continue
+        n = row_number
+        row_issues: list[dict] = []
+        sample_id = _parse_text(cells[column_map["sample_id"]], n, "sample_id",
+                                row_issues, "样本号")
+        account_id = _parse_text(cells[column_map["account_id"]], n,
+                                 "account_id", row_issues, "账户")
+        audit = _parse_epoch(cells[column_map["audit_at"]], n, "audit_at",
+                             row_issues, "审核时刻")
+        label_raw = cells[column_map["label"]].strip()
+        label = None
+        if not label_raw:
+            row_issues.append(_row_error(n, "label", "required", "标签不能为空。"))
+        elif not _LABEL_RE.fullmatch(label_raw):
+            row_issues.append(_row_error(n, "label", "invalid_label",
+                                         "标签只能是 0 或 1。",
+                                         cells[column_map["label"]]))
+        else:
+            label = int(label_raw)
+        for detail in row_issues:
+            issues.add(detail)
+        if row_issues:
+            continue
+        if not (sample_id and account_id and audit is not None
+                and label is not None):
+            continue
+        if sample_id in seen:
+            issues.add(_row_error(n, "sample_id", "duplicate_sample_id",
+                                  f"样本号与第 {seen[sample_id]} 行重复。"))
+            continue
+        seen[sample_id] = n
+        emitted += 1
+        yield SampleRow(n, sample_id, account_id, audit, label)
+    if issues.total:
+        raise BatchRejected(
+            f"样本批次整批拒收：共 {data_rows} 行，发现 {issues.total} 处问题，"
+            "未写入任何数据。",
+            issues.summary(),
+        )
+    if emitted == 0:
+        raise BatchRejected("样本 CSV 没有有效数据行。",
+                            [_row_error(2, "", "no_rows", "至少需要一行样本。")])
+
+
+def _spool_bytes(data: bytes) -> Path:
+    """Back-compat helper: park raw bytes in a temp file for the streamers."""
+    fd, name = tempfile.mkstemp(prefix="csv-spool-", suffix=".csv")
+    path = Path(name)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def parse_transactions(data: bytes) -> ParsedBatch:
+    """Whole-bytes convenience wrapper around the streaming parser.
+
+    Production ingestion streams from the upload spool file; this remains for
+    callers and tests that already hold the payload in memory.
+    """
+    path = _spool_bytes(data)
+    try:
+        return ParsedBatch(transactions=list(stream_transactions(path)))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def parse_samples(data: bytes) -> ParsedSamples:
+    path = _spool_bytes(data)
+    try:
+        return ParsedSamples(samples=list(stream_samples(path)))
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def _parse_text(value: str, row: int, name: str, issues: list[dict],
@@ -201,7 +445,7 @@ def _parse_epoch(value: str, row: int, name: str, issues: list[dict],
     if not v:
         issues.append(_row_error(row, name, "required", f"{label}不能为空。"))
         return None
-    if not re.fullmatch(r"-?\d{1,11}", v):
+    if not _EPOCH_RE.fullmatch(v):
         issues.append(_row_error(
             row, name, "not_utc_seconds",
             f"{label}必须是 UTC 秒整数（如 1736071200），不接受日期字符串或小数。", v))
@@ -223,7 +467,7 @@ def _parse_decimal(value: str, row: int, name: str, issues: list[dict],
     # Plain decimal only: no scientific notation, no thousands separators,
     # no currency symbols. At most two fractional digits keeps the stored
     # integer minor-unit value exact.
-    if not re.fullmatch(r"-?\d{1,15}(?:\.\d{1,2})?", v):
+    if not _DECIMAL_RE.fullmatch(v):
         issues.append(_row_error(
             row, name, "not_decimal",
             f"{label}必须是十进制金额（最多两位小数，如 125.00），且不得为科学计数法。", v))
@@ -266,96 +510,6 @@ def canonical_raw_hash(fields: list[str]) -> str:
         h.update(part.encode("utf-8"))
         h.update(b"\x1f")
     return h.hexdigest()
-
-
-def parse_transactions(data: bytes) -> ParsedBatch:
-    rows = _read_table(data, TRANSACTION_HEADERS, "交易", TRANSACTION_ALIASES)
-    issues: list[dict] = []
-    txns: list[TransactionRevision] = []
-    for row in rows:
-        if "__error__" in row:
-            issues.append(row["__error__"])
-            continue
-        n = row["__row__"]
-        event_id = _parse_text(row["event_id"], n, "event_id", issues, "事件号")
-        account_id = _parse_text(row["account_id"], n, "account_id", issues, "账户")
-        occurred = _parse_epoch(row["occurred_at"], n, "occurred_at", issues, "发生时刻")
-        ingested = _parse_epoch(row["ingested_at"], n, "ingested_at", issues, "入库时刻")
-        amount = _parse_decimal(row["amount"], n, "amount", issues, "金额")
-        action = _parse_action(row["action"], n, issues)
-        if action == ACTION_REVISE and amount is not None and amount == 0:
-            issues.append(_row_error(n, "amount", "amount_positive",
-                                     "更新交易的金额必须大于 0。", row["amount"]))
-            continue
-        if not (event_id and account_id and occurred is not None
-                and ingested is not None and amount is not None and action):
-            continue
-        txn = TransactionRevision(
-            row_number=n, event_id=event_id, account_id=account_id,
-            occurred_at=occurred, ingested_at=ingested, amount=amount,
-            amount_minor=int(amount * 100),
-            amount_text=format(amount, ".2f"),
-            action=action,
-            raw_hash=canonical_raw_hash([
-                event_id, account_id, str(occurred), str(ingested),
-                format(amount, ".2f"), action,
-            ]),
-        )
-        txns.append(txn)
-    if issues:
-        raise BatchRejected(
-            f"交易批次整批拒收：共 {len(rows)} 行，发现 {len(issues)} 处问题，未写入任何数据。",
-            issues,
-        )
-    if not txns:
-        raise BatchRejected("交易 CSV 没有有效数据行。",
-                            [_row_error(2, "", "no_rows", "至少需要一行交易。")])
-    return ParsedBatch(transactions=txns)
-
-
-def parse_samples(data: bytes) -> ParsedSamples:
-    rows = _read_table(data, SAMPLE_HEADERS, "样本", SAMPLE_ALIASES)
-    issues: list[dict] = []
-    samples: list[SampleRow] = []
-    for row in rows:
-        if "__error__" in row:
-            issues.append(row["__error__"])
-            continue
-        n = row["__row__"]
-        sample_id = _parse_text(row["sample_id"], n, "sample_id", issues, "样本号")
-        account_id = _parse_text(row["account_id"], n, "account_id", issues, "账户")
-        audit = _parse_epoch(row["audit_at"], n, "audit_at", issues, "审核时刻")
-        label_raw = row["label"].strip()
-        label = None
-        if not label_raw:
-            issues.append(_row_error(n, "label", "required", "标签不能为空。"))
-        elif not re.fullmatch(r"0|1", label_raw):
-            issues.append(_row_error(n, "label", "invalid_label",
-                                     "标签只能是 0 或 1。", row["label"]))
-        else:
-            label = int(label_raw)
-        if not (sample_id and account_id and audit is not None and label is not None):
-            continue
-        samples.append(SampleRow(n, sample_id, account_id, audit, label))
-    if issues:
-        raise BatchRejected(
-            f"样本批次整批拒收：共 {len(rows)} 行，发现 {len(issues)} 处问题，未写入任何数据。",
-            issues,
-        )
-    if not samples:
-        raise BatchRejected("样本 CSV 没有有效数据行。",
-                            [_row_error(2, "", "no_rows", "至少需要一行样本。")])
-    seen: dict[str, int] = {}
-    dupes = []
-    for s in samples:
-        if s.sample_id in seen:
-            dupes.append(_row_error(s.row_number, "sample_id", "duplicate_sample_id",
-                                    f"样本号与第 {seen[s.sample_id]} 行重复。"))
-        else:
-            seen[s.sample_id] = s.row_number
-    if dupes:
-        raise BatchRejected("样本批次整批拒收：样本号在同一上传中必须唯一。", dupes)
-    return ParsedSamples(samples=samples)
 
 
 def fmt_utc(epoch: int) -> str:

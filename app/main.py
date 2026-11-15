@@ -5,6 +5,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
+import hashlib
+import os
+import tempfile
 
 from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import (
@@ -14,7 +17,7 @@ from fastapi.templating import Jinja2Templates
 
 from .config import Settings
 from .csvparse import BatchRejected, ParseError
-from .service import AppService, ConflictError, format_utc
+from .service import AppService, ConflictError, StagedUpload, format_utc
 from .worker import ReportWorker
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -104,8 +107,9 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     @app.post("/upload-transactions")
     async def upload_transactions_form(file: UploadFile):
         try:
-            data = await _read_limited(file, settings.max_upload_bytes)
-            result = service.upload_transactions(file.filename or "transactions.csv", data)
+            staged = await _spool_upload(file, service, settings)
+            result = service.upload_transactions(file.filename or "transactions.csv",
+                                                 staged)
             return RedirectResponse(
                 f"/?notice={quote('交易批次 #' + str(result['batch_id']) + ' 已入库，共 ' + str(result['rows']) + ' 行')}",
                 status_code=303)
@@ -116,8 +120,8 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     @app.post("/upload-samples")
     async def upload_samples_form(file: UploadFile):
         try:
-            data = await _read_limited(file, settings.max_upload_bytes)
-            result = service.upload_samples(file.filename or "samples.csv", data)
+            staged = await _spool_upload(file, service, settings)
+            result = service.upload_samples(file.filename or "samples.csv", staged)
             return RedirectResponse(
                 f"/?notice={quote('样本批次 #' + str(result['batch_id']) + ' 已入库，共 ' + str(result['rows']) + ' 行')}",
                 status_code=303)
@@ -148,13 +152,13 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     # ------------------------------------------------------------------ #
     @app.post("/api/uploads/transactions")
     async def api_upload_transactions(file: UploadFile):
-        data = await _read_limited(file, settings.max_upload_bytes)
-        return service.upload_transactions(file.filename or "transactions.csv", data)
+        staged = await _spool_upload(file, service, settings)
+        return service.upload_transactions(file.filename or "transactions.csv", staged)
 
     @app.post("/api/uploads/samples")
     async def api_upload_samples(file: UploadFile):
-        data = await _read_limited(file, settings.max_upload_bytes)
-        return service.upload_samples(file.filename or "samples.csv", data)
+        staged = await _spool_upload(file, service, settings)
+        return service.upload_samples(file.filename or "samples.csv", staged)
 
     @app.get("/api/batches")
     def api_batches():
@@ -201,25 +205,48 @@ def create_app(settings: Settings | None = None, start_worker: bool = True) -> F
     return app
 
 
-async def _read_limited(file: UploadFile, limit: int) -> bytes:
-    chunks: list[bytes] = []
+async def _spool_upload(file: UploadFile, service: AppService,
+                        settings: Settings) -> StagedUpload:
+    """Stream the multipart body straight to a spool file.
+
+    Only one fixed-size chunk is held at a time, so an upload near the size
+    limit never duplicates itself as joined byte strings, decoded text or
+    parsed objects in memory. The service owns the spool afterwards and
+    removes it on commit or rejection.
+    """
+    limit = settings.max_upload_bytes
+    digest = hashlib.sha256()
     total = 0
-    while True:
-        chunk = await file.read(1 << 20)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > limit:
-            raise BatchRejected(
-                "上传文件超过大小限制。",
-                [{"row": 0, "field": "", "code": "too_large",
-                  "message": f"上限 {limit} 字节。", "value": ""}])
-        chunks.append(chunk)
+    fd, name = tempfile.mkstemp(prefix=".spool-", suffix=".csv",
+                                dir=settings.uploads_dir)
+    spool_path = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise BatchRejected(
+                        "上传文件超过大小限制。",
+                        [{"row": 0, "field": "", "code": "too_large",
+                          "message": f"上限 {limit} 字节。", "value": ""}])
+                digest.update(chunk)
+                fh.write(chunk)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        spool_path.unlink(missing_ok=True)
+        raise
     if total == 0:
+        spool_path.unlink(missing_ok=True)
         raise BatchRejected(
             "上传文件为空。",
             [{"row": 0, "field": "", "code": "empty", "message": "0 字节。",
               "value": ""}])
-    return b"".join(chunks)
+    return StagedUpload(path=spool_path, byte_size=total,
+                        sha256=digest.hexdigest(),
+                        filename=file.filename or "upload.csv")
 
 # The container uses the factory form: uvicorn app.main:create_app --factory

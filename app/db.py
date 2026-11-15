@@ -81,6 +81,27 @@ CREATE TABLE IF NOT EXISTS reports (
 CREATE INDEX IF NOT EXISTS ix_reports_status ON reports(status);
 """
 
+# Connection-scoped scratch space for one streaming ingestion. It is created
+# inside the batch's IMMEDIATE transaction, populated in bounded chunks, and
+# disappears when the connection closes; conflict and idempotency checks then
+# run as set-based SQL instead of per-row Python lookups.
+TEMP_STAGING_DDL = """
+CREATE TEMP TABLE txn_staging (
+    row_number  INTEGER NOT NULL,
+    event_id    TEXT NOT NULL,
+    account_id  TEXT NOT NULL,
+    occurred_at INTEGER NOT NULL,
+    ingested_at INTEGER NOT NULL,
+    amount_minor INTEGER NOT NULL,
+    amount_text TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    raw_hash    TEXT NOT NULL
+)
+"""
+
+TEMP_STAGING_INDEX = (
+    "CREATE INDEX ix_txn_staging_key ON txn_staging(event_id, ingested_at)")
+
 
 class Database:
     def __init__(self, path: str | Path):
@@ -91,13 +112,23 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-8000")
         return conn
 
     def init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+
+    def temp_staging_ddl(self) -> str:
+        return TEMP_STAGING_DDL
+
+    def temp_staging_index(self) -> str:
+        return TEMP_STAGING_INDEX
 
     @contextmanager
     def write_transaction(self):
@@ -105,8 +136,12 @@ class Database:
         conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-8000")
             with self._lock:
                 conn.execute("BEGIN IMMEDIATE")
                 try:
